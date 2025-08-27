@@ -16,8 +16,11 @@ import (
 	"strings"
 
 	yaml "gopkg.in/yaml.v3"
-)
 
+	// ---- ILM (added)
+	"context"
+)
+ 
 //go:embed static
 var staticDir embed.FS
 
@@ -55,6 +58,26 @@ var (
 	verbose      bool
 	config       Config
 )
+
+// ---- ILM (added): minimal DTOs for API response
+type ilmStatus struct {
+	OperationMode string `json:"operation_mode"`
+}
+type ilmIndex struct {
+	Index       string `json:"index"`
+	Managed     bool   `json:"managed"`
+	Policy      string `json:"policy"`
+	Phase       string `json:"phase"`
+	Action      string `json:"action"`
+	Step        string `json:"step"`
+	FailedStep  string `json:"failed_step,omitempty"`
+	PhaseTimeMs int64  `json:"phase_time_millis"`
+	StepTimeMs  int64  `json:"step_time_millis"`
+}
+type ilmPayload struct {
+	Status  ilmStatus `json:"status"`
+	Indices []ilmIndex `json:"indices"`
+}
 
 // loadConfig loads configuration from YAML file
 func loadConfig(configFile string) error {
@@ -193,6 +216,9 @@ func main() {
 	// Register the proxy handler for Elasticsearch requests
 	http.Handle("/proxy", authMiddleware(http.HandlerFunc(proxyHandler)))
 
+	// ---- ILM (added): Register ILM API endpoint
+	http.Handle("/api/ilm", authMiddleware(http.HandlerFunc(ilmHandler)))
+
 	// Get server address and port from config
 	address := config.Server.Address
 	port := config.Server.Port
@@ -315,3 +341,107 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(esRes.StatusCode)
 	io.Copy(w, esRes.Body)
 }
+
+// ---- ILM (added): minimal handler that calls ES and returns status + index ILM info
+func ilmHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Only GET method is allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 12_000_000_000) // ~12s
+	defer cancel()
+
+	base := strings.TrimSuffix(config.Elasticsearch.URL, "/")
+
+	// 1) ILM status
+	statusURL := base + "/_ilm/status"
+	statusReq, err := http.NewRequestWithContext(ctx, http.MethodGet, statusURL, nil)
+	if err != nil {
+		http.Error(w, "Failed to create ILM status request: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	statusRes, err := http.DefaultClient.Do(statusReq)
+	if err != nil {
+		http.Error(w, "Failed to fetch ILM status: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	defer statusRes.Body.Close()
+
+	var st ilmStatus
+	if statusRes.StatusCode < 400 {
+		if err := json.NewDecoder(statusRes.Body).Decode(&st); err != nil {
+			http.Error(w, "Failed to decode ILM status: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+	} else {
+		// Return error as-is from ES
+		w.WriteHeader(statusRes.StatusCode)
+		io.Copy(w, statusRes.Body)
+		return
+	}
+
+	// 2) ILM explain for all managed indices
+	explainURL := base + "/*/_ilm/explain?only_managed=true"
+	explainReq, err := http.NewRequestWithContext(ctx, http.MethodGet, explainURL, nil)
+	if err != nil {
+		http.Error(w, "Failed to create ILM explain request: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	explainRes, err := http.DefaultClient.Do(explainReq)
+	if err != nil {
+		http.Error(w, "Failed to fetch ILM explain: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	defer explainRes.Body.Close()
+
+	if explainRes.StatusCode >= 400 {
+		w.WriteHeader(explainRes.StatusCode)
+		io.Copy(w, explainRes.Body)
+		return
+	}
+
+	var raw struct {
+		Indices map[string]struct {
+			Index       string `json:"index"`
+			Managed     bool   `json:"managed"`
+			Policy      string `json:"policy"`
+			Phase       string `json:"phase"`
+			Action      string `json:"action"`
+			Step        string `json:"step"`
+			FailedStep  string `json:"failed_step"`
+			PhaseTimeMs int64  `json:"phase_time_millis"`
+			StepTimeMs  int64  `json:"step_time_millis"`
+		} `json:"indices"`
+	}
+	if err := json.NewDecoder(explainRes.Body).Decode(&raw); err != nil {
+		http.Error(w, "Failed to decode ILM explain: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	out := make([]ilmIndex, 0, len(raw.Indices))
+	for name, v := range raw.Indices {
+		idx := v.Index
+		if idx == "" {
+			idx = name
+		}
+		out = append(out, ilmIndex{
+			Index:       idx,
+			Managed:     v.Managed,
+			Policy:      v.Policy,
+			Phase:       v.Phase,
+			Action:      v.Action,
+			Step:        v.Step,
+			FailedStep:  v.FailedStep,
+			PhaseTimeMs: v.PhaseTimeMs,
+			StepTimeMs:  v.StepTimeMs,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ilmPayload{
+		Status:  st,
+		Indices: out,
+	})
+}
+

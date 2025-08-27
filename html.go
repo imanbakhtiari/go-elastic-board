@@ -305,6 +305,41 @@ const dashboardHTML = `
                 </div>
             </div>
 
+	    <!-- ILM Overview (added) -->
+            <div class="bg-white dark:bg-gray-800 p-4 rounded-xl shadow-md mb-4" id="ilmSection">
+                <div class="flex items-center justify-between mb-3">
+                    <h3 class="text-lg font-semibold text-gray-900 dark:text-white">Index Lifecycle Management</h3>
+                    <div class="flex items-center gap-2">
+                        <span id="ilmModeDot" class="inline-block w-3 h-3 rounded-full bg-yellow-500"></span>
+                        <span id="ilmModeText" class="text-sm text-gray-600 dark:text-gray-300">—</span>
+                        <input id="ilmFilter" type="text" placeholder="Filter indices…" class="ml-4 w-56 rounded-md border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-white px-2 py-1 text-sm">
+                    </div>
+                </div>
+
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700" id="ilmTable">
+                        <thead class="bg-gray-50 dark:bg-gray-700">
+                            <tr>
+                                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Index</th>
+                                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Policy</th>
+                                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Phase</th>
+                                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Action</th>
+                                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Step</th>
+                                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Since</th>
+                                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Error</th>
+                            </tr>
+                        </thead>
+                        <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
+                            <!-- ILM rows (added) -->
+                        </tbody>
+                    </table>
+                </div>
+                <p class="mt-2 text-xs text-gray-500 dark:text-gray-400">“Since” is computed from <code>phase_time_millis</code> / <code>step_time_millis</code>.</p>
+            </div>
+            <!-- /ILM Overview (added) -->
+
+            <!-- Cluster Settings Table -->
+
             <!-- Cluster Settings Table -->
             <div class="mt-4 bg-white dark:bg-gray-800 p-4 rounded-xl shadow-md">
                 <div class="flex items-center justify-between mb-4">
@@ -606,6 +641,7 @@ const dashboardHTML = `
                 updateNodeList(catNodesData, catShardsData, nodeStatsData, nodeInfoData);
                 updateAggregateCharts(nodeStatsData);
                 updateSmallCharts(healthData);
+		loadILM();
                 
                 // Fetch cluster settings on first load or manual refresh
                 if (!document.getElementById('clusterSettingsTable').querySelector('tr:not(.loading)')) {
@@ -2208,8 +2244,81 @@ const dashboardHTML = `
                 console.error('Error updating chart:', chartId, error);
             }
         }
-    </script>
+                // ==== ILM (added) ====
+        function ilmDotClass(mode) {
+            const m = (mode || '').toUpperCase();
+            if (m === 'RUNNING') return 'bg-green-500';
+            if (m === 'STOPPING') return 'bg-yellow-500';
+            if (m === 'STOPPED') return 'bg-red-500';
+            return 'bg-yellow-500';
+        }
 
+        function ilmTimeago(ms){
+            if(!ms) return '—';
+            const s = Math.max(0, (Date.now() - ms) / 1000);
+            const u = [['y',31536000],['mo',2592000],['d',86400],['h',3600],['m',60],['s',1]];
+            for(const [lbl,sec] of u){ if(s>=sec) return Math.floor(s/sec)+lbl+' ago'; }
+            return 'just now';
+        }
+
+        function renderIlmTable(indices){
+            const tbody = document.querySelector('#ilmTable tbody');
+            if(!tbody) return;
+            const q = (document.getElementById('ilmFilter')?.value || '').toLowerCase();
+            tbody.innerHTML = '';
+
+            (indices || []).forEach(it => {
+                const name = it.index || '—';
+                if(q && !name.toLowerCase().includes(q)) return;
+
+                const tr = document.createElement('tr');
+                const td = (html) => {
+                    const n = document.createElement('td');
+                    n.className = 'px-3 py-2 text-sm text-gray-700 dark:text-gray-200';
+                    n.innerHTML = html;
+                    return n;
+                };
+                tr.appendChild(td('<code>'+name+'</code>'));
+                tr.appendChild(td('<span class="px-2 py-0.5 rounded bg-gray-100 dark:bg-gray-700">'+(it.policy||'—')+'</span>'));
+                tr.appendChild(td(it.phase || '—'));
+                tr.appendChild(td(it.action || '—'));
+                tr.appendChild(td(it.step || '—'));
+                tr.appendChild(td(ilmTimeago(it.phase_time_millis || it.step_time_millis)));
+                tr.appendChild(td(it.failed_step || '—'));
+                tbody.appendChild(tr);
+            });
+        }
+
+        async function loadILM(){
+            try{
+                const res = await fetch('/api/ilm', { headers: { 'Accept': 'application/json' } });
+                if(!res.ok) return;
+                const data = await res.json();
+
+                const mode = data?.status?.operation_mode || '—';
+                const dot = document.getElementById('ilmModeDot');
+                const txt = document.getElementById('ilmModeText');
+                if (dot) {
+                    dot.classList.remove('bg-green-500','bg-yellow-500','bg-red-500');
+                    dot.classList.add(ilmDotClass(mode));
+                }
+                if (txt) txt.textContent = mode;
+
+                renderIlmTable(data?.indices || []);
+            } catch(e){
+                // keep silent to avoid disrupting other widgets
+                // console.debug('ILM load error', e);
+            }
+        }
+
+        // Re-filter on typing
+        document.addEventListener('input', function(e){
+            if (e.target && e.target.id === 'ilmFilter') {
+                loadILM();
+            }
+        });
+        // ==== /ILM (added) ====
+    </script>
 </body>
 </html>
 `
